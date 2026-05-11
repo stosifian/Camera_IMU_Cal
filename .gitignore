@@ -1,0 +1,16 @@
+# data
+vicon_room1/
+*.bag
+*.zip
+*.ply
+
+# env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# outputs
+*.png
+*.pdf
