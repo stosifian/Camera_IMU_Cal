@@ -14,3 +14,7 @@ __pycache__/
 # outputs
 *.png
 *.pdf
+
+# report assets (tracked explicitly)
+!window_vs_resnorm.png
+!report.html
