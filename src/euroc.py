@@ -57,6 +57,11 @@ class CameraData:
     def __len__(self) -> int:
         return len(self.timestamps_ns)
 
+@dataclass
+class GroundTruth_Data:
+    timestamps_ns: np.ndarray    # (N,) int64, nanoseconds
+    position: np.ndarray         # (N,3) m [x, y, z]
+    orientation: np.ndarray      # (N,4) rad [qw, qx, qy, qz]
 
 class EuRoCSequence:
     """Loads one EuRoC mav0 sequence from disk."""
@@ -69,15 +74,17 @@ class EuRoCSequence:
         self.imu_params = self._load_imu_params()
         self.cam0_params = self._load_camera_params("cam0")
         self.cam1_params = self._load_camera_params("cam1")
+        self.groundtruth = self._load_groundtruth_data()
 
     # ------------------------------------------------------------------
     # Data loaders
     # ------------------------------------------------------------------
 
+    # three lines below pd.read_csv tell pandas to drop the header row using the hashtag comment and then assumes the column data based on what's described in 'names'
     def _load_imu_data(self) -> ImuData:
-        df = pd.read_csv(
+        df = pd.read_csv( 
             self.root / "imu0" / "data.csv",
-            comment="#", header=0,
+            comment="#", header=0,  
             names=["ts", "wx", "wy", "wz", "ax", "ay", "az"],
         )
         return ImuData(
@@ -97,6 +104,18 @@ class EuRoCSequence:
         return CameraData(
             timestamps_ns=df["ts"].to_numpy(dtype=np.int64),
             image_paths=paths,
+        )
+
+    def _load_groundtruth_data(self) -> GroundTruth_Data:
+        df = pd.read_csv(
+            self.root / "vicon0" / "data.csv",
+            comment="#", header=0,
+            names=["ts", "x", "y", "z", "qw", "qx", "qy", "qz"]
+        )
+        return GroundTruth_Data(
+            timestamps_ns=df["ts"].to_numpy(dtype=np.int64),
+            position=df[["x","y","z"]].to_numpy(dtype=np.float64),
+            orientation=df[["qw","qx","qy","qz"]].to_numpy(dtype=np.float64),
         )
 
     # ------------------------------------------------------------------
