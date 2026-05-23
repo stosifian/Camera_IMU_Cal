@@ -100,84 +100,6 @@ def unpack_params(params):
 
     return T_cam_imu, t_d
 
-
-
-MAV0 = Path(__file__).parent.parent / "vicon_room1/V1_01_easy/mav0"
-
-seq = EuRoCSequence(MAV0)
-
-# --- stats ---
-t0 = min(seq.imu.timestamps_ns[0], seq.cam0.timestamps_ns[0])
-t1 = max(seq.imu.timestamps_ns[-1], seq.cam0.timestamps_ns[-1])
-duration = (t1 - t0) / 1e9
-
-print(f"Duration : {duration:.2f} s")
-print(f"IMU      : {len(seq.imu)} samples @ {seq.imu_params.rate_hz} Hz")
-print(f"Cam0     : {len(seq.cam0)} frames  @ {seq.cam0_params.rate_hz} Hz")
-print(f"Cam1     : {len(seq.cam1)} frames  @ {seq.cam1_params.rate_hz} Hz")
-print(f"Cam0 K   :\n{seq.cam0_params.K}")
-print(f"Cam0 dist: {seq.cam0_params.distortion_coefficients}")
-
-# --- IMU plot ---
-debug_plot = 0
-if debug_plot:
-    t = (seq.imu.timestamps_ns - seq.imu.timestamps_ns[0]) / 1e9
-    fig, axes = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
-    for i, label in enumerate(["x", "y", "z"]):
-        axes[0].plot(t, seq.imu.angular_velocity[:, i], label=label)
-        axes[1].plot(t, seq.imu.linear_acceleration[:, i], label=label)
-    axes[0].set_ylabel("Angular vel [rad/s]")
-    axes[1].set_ylabel("Linear accel [m/s²]")
-    axes[1].set_xlabel("Time [s]")
-    for ax in axes:
-        ax.legend(loc="upper right")
-    plt.tight_layout()
-    plt.savefig("imu_plot.png", dpi=150)
-    print("\nSaved imu_plot.png")
-
-    # --- first camera frame ---
-    img = seq.cam0.load_image(0)
-    print(f"Frame 0  : shape={img.shape}, dtype={img.dtype}")
-    fig2, ax2 = plt.subplots(figsize=(8, 5))
-    ax2.imshow(img, cmap="gray")
-    ax2.set_title("cam0 frame 0")
-    ax2.axis("off")
-    plt.tight_layout()
-    plt.savefig("cam0_frame0.png", dpi=150)
-    print("Saved cam0_frame0.png")
-
-    # --- GT Plot ---
-    t = (seq.groundtruth.timestamps_ns - seq.groundtruth.timestamps_ns[0]) / 1e9
-    fig, axes = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
-    for i, label in enumerate(["x", "y", "z"]):
-        axes[0].plot(t, seq.groundtruth.position[:, i], label=label)
-
-    axes[0].set_ylabel("Position [m]")
-    axes[0].set_xlabel("Time [s]")
-
-    for i, label in enumerate(["w", "x", "y", "z"]):
-        axes[1].plot(t, seq.groundtruth.orientation[:, i], label=label)
-
-    axes[1].set_ylabel("Quaternion [rad]")
-    axes[1].set_xlabel("Time [s]")
-
-
-    for ax in axes:
-        ax.legend(loc="upper right")
-    plt.tight_layout()
-    plt.tight_layout()
-    plt.savefig("GT_plot.png", dpi=150)
-    print("\nSaved GT_plot.png")
-
-
-
-
-# --- Interpolate ground truth ---
-seq.groundtruth.offset = seq.groundtruth.timestamps_ns[0]
-seq.groundtruth.ds_timestamps_ns = seq.groundtruth.timestamps_ns[::10] # downsample from 100 Hz to 10 Hz
-seq.groundtruth.ds_orientation = seq.groundtruth.orientation[::10,:]
-seq.groundtruth.ds_position = seq.groundtruth.position[::10,:]
-
 # --- Integrate IMU between each downsampled GT value, set up residual function ---
 def residuals(params, seq):
     
@@ -240,107 +162,234 @@ def residuals(params, seq):
     return np.concatenate(errors)
 
 
-x0 = np.zeros(3)
-err = residuals(x0, seq)
-print(f"Residual shape: {err.shape}")
-print(f"Residual norm at identity guess: {np.linalg.norm(err)}")
-print(f"First 3 residuals: {err[:3]}")
+MAV_Sequence_Paths = []
+# Easy
+MAV1 = Path(__file__).parent.parent / "vicon_room1/V1_01_easy/mav0"
 
-# -- Optimize --
-result = least_squares(residuals, x0=x0, args=(seq,), method='lm', verbose=2)
-res_rot = result.fun.reshape(-1, 3)
-print(f"Recovered rotvec: {result.x[:3]}")
-print(f"Recovered rotation (deg): {np.degrees(np.linalg.norm(result.x[:3])):.4f}")
-print(f"Final cost: {result.cost}")
+# Medium
+MAV2 = Path(__file__).parent.parent / "vicon_room1/V1_02_medium/mav0"
 
-# -- Calculate covariance -- #
+# Hard
+MAV3 = Path(__file__).parent.parent / "vicon_room1/V1_03_difficult/mav0"
 
-# Jacobian at the solution: each row is one residual, each column is one
-# parameter. J[i, k] = ∂residual_i / ∂param_k, evaluated at result.x.
-# scipy computed this numerically during optimization (finite differences)
-# and stores the final one in result.jac. Shape: (n_residuals, n_params).
-J = result.jac # shape: (n_residuals, n_params)
+MAV_Sequence_Paths = [MAV1, MAV2, MAV3]
 
-# Residual variance: sum of squared residuals divided by degrees of freedom
-n_residuals = J.shape[0]
-n_params = J.shape[1]
+recovered_rotvecs = []
+recovered_rotation_magnitudes_deg = []
+axis_uncertainty_deg = []
+total_rotation_deg = []
+condition_numbers = []
 
-# result.fun is the residual vector evaluated at the final parameters —
-# i.e., what residuals(result.x, ...) returned. Shape: (n_residuals,).
-residuals_final = result.fun
+# Perform cal optimization for each sequence, and check results
+for jj in range(len(MAV_Sequence_Paths)):
+    seq = EuRoCSequence(MAV_Sequence_Paths[jj])
 
-# σ² (residual variance): how big the "leftover" errors are on average,
-# after the optimizer did its best. The denominator (n_residuals - n_params)
-# is the "degrees of freedom" correction — same idea as dividing by N-1
-# instead of N when computing a sample variance. It accounts for the fact
-# that fitting parameters absorbs some of the variance.
-#
-# Intuition: a model that fits the data perfectly (σ² → 0) implies very
-# precise parameter estimates. A model with large residuals (σ² big)
-# implies looser estimates.
-sigma_sq = np.sum(residuals_final**2) / (n_residuals - n_params)
+    # --- stats ---
+    t0 = min(seq.imu.timestamps_ns[0], seq.cam0.timestamps_ns[0])
+    t1 = max(seq.imu.timestamps_ns[-1], seq.cam0.timestamps_ns[-1])
+    duration = (t1 - t0) / 1e9
+    #
+    print(f"Duration : {duration:.2f} s")
+    print(f"IMU      : {len(seq.imu)} samples @ {seq.imu_params.rate_hz} Hz")
+    print(f"Cam0     : {len(seq.cam0)} frames  @ {seq.cam0_params.rate_hz} Hz")
+    print(f"Cam1     : {len(seq.cam1)} frames  @ {seq.cam1_params.rate_hz} Hz")
+    print(f"Cam0 K   :\n{seq.cam0_params.K}")
+    print(f"Cam0 dist: {seq.cam0_params.distortion_coefficients}")
 
-# Covariance via pseudoinverse (more numerically stable than direct inv)
-# SVD decomposes J = U · diag(s) · Vᵀ
-#   U:  (n_residuals, n_params) — orthonormal columns
-#   s:  (n_params,)             — singular values, sorted descending
-#   Vt: (n_params, n_params)    — orthonormal rows (Vᵀ)
-#
-# full_matrices=False uses the "thin" SVD: faster and gives shapes that
-# match our use case (we don't need the full n_residuals × n_residuals U).
-U, s, Vt = svd(J, full_matrices=False)
+    # --- IMU plot ---
+    debug_plot = 0
+    if debug_plot:
+        t = (seq.imu.timestamps_ns - seq.imu.timestamps_ns[0]) / 1e9
+        fig, axes = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
+        for i, label in enumerate(["x", "y", "z"]):
+            axes[0].plot(t, seq.imu.angular_velocity[:, i], label=label)
+            axes[1].plot(t, seq.imu.linear_acceleration[:, i], label=label)
+        axes[0].set_ylabel("Angular vel [rad/s]")
+        axes[1].set_ylabel("Linear accel [m/s²]")
+        axes[1].set_xlabel("Time [s]")
+        for ax in axes:
+            ax.legend(loc="upper right")
+        plt.tight_layout()
+        plt.savefig("imu_plot.png", dpi=150)
+        print("\nSaved imu_plot.png")
 
-# Treat signular values as effectively zero as they represent directions in parameter space 
-# where data is uninformative
-threshold = np.finfo(float).eps * max(J.shape) * s[0]
+        # --- first camera frame ---
+        img = seq.cam0.load_image(0)
+        print(f"Frame 0  : shape={img.shape}, dtype={img.dtype}")
+        fig2, ax2 = plt.subplots(figsize=(8, 5))
+        ax2.imshow(img, cmap="gray")
+        ax2.set_title("cam0 frame 0")
+        ax2.axis("off")
+        plt.tight_layout()
+        plt.savefig("cam0_frame0.png", dpi=150)
+        print("Saved cam0_frame0.png")
 
-# Invert the singular values, but set inversions to zero for any
-# singular value below threshold. This is what makes this a *pseudoinverse*
-# rather than a true inverse — it gracefully handles rank deficiency.
-# For well-constrained directions: s_inv[k] = 1/s[k] (normal inversion).
-# For near-zero directions: s_inv[k] = 0 (don't blow up to infinity).
-s_inv = np.where(s > threshold, 1/s, 0)
+        # --- GT Plot ---
+        t = (seq.groundtruth.timestamps_ns - seq.groundtruth.timestamps_ns[0]) / 1e9
+        fig, axes = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
+        for i, label in enumerate(["x", "y", "z"]):
+            axes[0].plot(t, seq.groundtruth.position[:, i], label=label)
 
-# Reconstruct (Jᵀ J)⁻¹ from the SVD and scale by σ² to get the covariance.
-#
-# The math: J = U diag(s) Vᵀ implies Jᵀ J = V diag(s²) Vᵀ, so
-# (Jᵀ J)⁻¹ = V diag(1/s²) Vᵀ. In code: Vᵀ has shape (n_params, n_params),
-# so we transpose it back to V via Vt.T, then sandwich diag(s_inv²)
-# between V and Vᵀ.
-#
-# Final shape of cov: (n_params, n_params).
-#   Diagonal entries: variance of each parameter
-#   Off-diagonals: covariance between pairs of parameters
-cov = (Vt.T @ np.diag(s_inv**2) @ Vt) * sigma_sq
+        axes[0].set_ylabel("Position [m]")
+        axes[0].set_xlabel("Time [s]")
 
-sigma_per_param = np.sqrt(np.diag(cov))
-print(f"Recovered rotvec:        {result.x}")
-print(f"1-sigma uncertainty:     {sigma_per_param}")
-print(f"1-sigma (degrees):       {np.degrees(sigma_per_param)}")
-print(f"Correlation matrix:")
-print(cov / np.outer(sigma_per_param, sigma_per_param))
-print(f"Condition number J^T*J: {s.min()/s.max()}")
+        for i, label in enumerate(["w", "x", "y", "z"]):
+            axes[1].plot(t, seq.groundtruth.orientation[:, i], label=label)
+
+        axes[1].set_ylabel("Quaternion [rad]")
+        axes[1].set_xlabel("Time [s]")
 
 
+        for ax in axes:
+            ax.legend(loc="upper right")
+        plt.tight_layout()
+        plt.tight_layout()
+        plt.savefig("GT_plot.png", dpi=150)
+        print("\nSaved GT_plot.png")
 
-# ----- Checking optimized result ----- #
-# First get max rotation window by calculating gt_rot_deg
-gt_rot_deg = []
-window_idx = []
-cnt = 0
-for i in range(len(seq.groundtruth.ds_timestamps_ns)-1):
+
+    # --- Interpolate ground truth ---
+    seq.groundtruth.offset = seq.groundtruth.timestamps_ns[0]
+    seq.groundtruth.ds_timestamps_ns = seq.groundtruth.timestamps_ns[::10] # downsample from 100 Hz to 10 Hz
+    seq.groundtruth.ds_orientation = seq.groundtruth.orientation[::10,:]
+    seq.groundtruth.ds_position = seq.groundtruth.position[::10,:]
+
+
+    x0 = np.zeros(3)
+    err = residuals(x0, seq)
+    print(f"Residual shape: {err.shape}")
+    print(f"Residual norm at identity guess: {np.linalg.norm(err)}")
+    print(f"First 3 residuals: {err[:3]}")
+
+    # -- Optimize --
+    result = least_squares(residuals, x0=x0, args=(seq,), method='lm', verbose=2)
+    res_rot = result.fun.reshape(-1, 3)
+    print(f"Recovered rotvec: {result.x[:3]}")
+    print(f"Recovered rotation (deg): {np.degrees(np.linalg.norm(result.x[:3])):.4f}")
+    print(f"Final cost: {result.cost}")
+
+    recovered_rotvecs.append(result.x[:3])
+    recovered_rotation_magnitudes_deg.append(np.degrees(np.linalg.norm(result.x[:3])))
+
+    # -- Calculate covariance -- #
+
+    # Jacobian at the solution: each row is one residual, each column is one
+    # parameter. J[i, k] = ∂residual_i / ∂param_k, evaluated at result.x.
+    # scipy computed this numerically during optimization (finite differences)
+    # and stores the final one in result.jac. Shape: (n_residuals, n_params).
+    J = result.jac # shape: (n_residuals, n_params)
+
+    # Residual variance: sum of squared residuals divided by degrees of freedom
+    n_residuals = J.shape[0]
+    n_params = J.shape[1]
+
+    # result.fun is the residual vector evaluated at the final parameters —
+    # i.e., what residuals(result.x, ...) returned. Shape: (n_residuals,).
+    residuals_final = result.fun
+
+    # σ² (residual variance): how big the "leftover" errors are on average,
+    # after the optimizer did its best. The denominator (n_residuals - n_params)
+    # is the "degrees of freedom" correction — same idea as dividing by N-1
+    # instead of N when computing a sample variance. It accounts for the fact
+    # that fitting parameters absorbs some of the variance.
+    #
+    # Intuition: a model that fits the data perfectly (σ² → 0) implies very
+    # precise parameter estimates. A model with large residuals (σ² big)
+    # implies looser estimates.
+    sigma_sq = np.sum(residuals_final**2) / (n_residuals - n_params)
+
+    # Covariance via pseudoinverse (more numerically stable than direct inv)
+    # SVD decomposes J = U · diag(s) · Vᵀ
+    #   U:  (n_residuals, n_params) — orthonormal columns
+    #   s:  (n_params,)             — singular values, sorted descending
+    #   Vt: (n_params, n_params)    — orthonormal rows (Vᵀ)
+    #
+    # full_matrices=False uses the "thin" SVD: faster and gives shapes that
+    # match our use case (we don't need the full n_residuals × n_residuals U).
+    U, s, Vt = svd(J, full_matrices=False)
+
+    # Treat signular values as effectively zero as they represent directions in parameter space 
+    # where data is uninformative
+    threshold = np.finfo(float).eps * max(J.shape) * s[0]
+
+    # Invert the singular values, but set inversions to zero for any
+    # singular value below threshold. This is what makes this a *pseudoinverse*
+    # rather than a true inverse — it gracefully handles rank deficiency.
+    # For well-constrained directions: s_inv[k] = 1/s[k] (normal inversion).
+    # For near-zero directions: s_inv[k] = 0 (don't blow up to infinity).
+    s_inv = np.where(s > threshold, 1/s, 0)
+
+    # Reconstruct (Jᵀ J)⁻¹ from the SVD and scale by σ² to get the covariance.
+    #
+    # The math: J = U diag(s) Vᵀ implies Jᵀ J = V diag(s²) Vᵀ, so
+    # (Jᵀ J)⁻¹ = V diag(1/s²) Vᵀ. In code: Vᵀ has shape (n_params, n_params),
+    # so we transpose it back to V via Vt.T, then sandwich diag(s_inv²)
+    # between V and Vᵀ.
+    #
+    # Final shape of cov: (n_params, n_params).
+    #   Diagonal entries: variance of each parameter
+    #   Off-diagonals: covariance between pairs of parameters
+    cov = (Vt.T @ np.diag(s_inv**2) @ Vt) * sigma_sq
+
+    sigma_per_param = np.sqrt(np.diag(cov))
+    print(f"Recovered rotvec:        {result.x}")
+    print(f"1-sigma uncertainty:     {sigma_per_param}")
+    print(f"1-sigma (degrees):       {np.degrees(sigma_per_param)}")
+    print(f"Correlation matrix:")
+    print(cov / np.outer(sigma_per_param, sigma_per_param))
+    print(f"Condition number J^T*J: {s.min()/s.max()}")
+
+    axis_uncertainty_deg.append(np.degrees(sigma_per_param))
+    condition_numbers.append(s.max()/s.min())
+
+
+    # ----- Checking optimized result ----- #
+    # First get max rotation window by calculating gt_rot_deg
+    gt_rot_deg = []
+    window_idx = []
+    total_rot = np.zeros(3)
+    cnt = 0
+    for i in range(len(seq.groundtruth.ds_timestamps_ns)-1):
+            
+        # Mask samples so they're sliced from the respective time window
+        int_indices = np.where((seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1]))
+        int_angular_velocity = seq.imu.angular_velocity[int_indices]
+        int_linear_accel = seq.imu.linear_acceleration[int_indices]
+        int_timestamps_s = seq.imu.timestamps_ns[int_indices] / 1e9
+
+        # Skip initial part of sequence where time offset exists between IMU and GT
+        if len(int_timestamps_s) < 2:
+            #print(i)
+            continue
         
-    # Mask samples so they're sliced from the respective time window
-    int_indices = np.where((seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1]))
-    int_angular_velocity = seq.imu.angular_velocity[int_indices]
-    int_linear_accel = seq.imu.linear_acceleration[int_indices]
-    int_timestamps_s = seq.imu.timestamps_ns[int_indices] / 1e9
 
-    # Skip initial part of sequence where time offset exists between IMU and GT
-    if len(int_timestamps_s) < 2:
-        #print(i)
-        continue
-    
+        # Cam-marker coordinates
+        T_i = vicon_pose_at_index(seq.groundtruth, i)
+        T_i1 = vicon_pose_at_index(seq.groundtruth, i+1)
+        dT_cam = relative_motion(T_i, T_i1)
+        delta_R_cam = dT_cam[:3, :3]
+        rotvec = Rotation.from_matrix(delta_R_cam).as_rotvec()
+        total_rot += np.abs(rotvec)   # abs so + and - rotations don't cancel
+
+        gt_rot_deg.append(np.degrees(np.linalg.norm(rotvec)))
+        window_idx.append(cnt)
+        cnt += 1
+
+    total_rotation_deg.append(np.degrees(total_rot))
+
+    R_recovered = Rotation.from_rotvec(result.x[:3]).as_matrix()
+
+    # Find the window with significant rotation
+    i = np.argmax(gt_rot_deg)  # window with most rotation
+    print(f"Window {i}: GT rotation = {gt_rot_deg[i]:.2f} deg")
+
+    # Apply the mask
+    mask = np.where((seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1]))
+    omega = seq.imu.angular_velocity[mask]
+    int_timestamps_s = seq.imu.timestamps_ns[mask] / 1e9
+    dt = np.mean(np.diff(int_timestamps_s))
+    delta_Rot = np.sum(omega * dt, axis=0)
+    R_imu_delta = Rotation.from_rotvec(delta_Rot).as_matrix()
 
     # Cam-marker coordinates
     T_i = vicon_pose_at_index(seq.groundtruth, i)
@@ -348,136 +397,158 @@ for i in range(len(seq.groundtruth.ds_timestamps_ns)-1):
     dT_cam = relative_motion(T_i, T_i1)
     delta_R_cam = dT_cam[:3, :3]
 
-    gt_rot_deg.append(np.degrees(np.linalg.norm(
-    Rotation.from_matrix(delta_R_cam).as_rotvec())))
-    window_idx.append(cnt)
-    cnt += 1
+    # Check the hand-eye constraint with recovered R
+    # Constraint: R · R_imu = R_marker · R
+    LHS = R_recovered @ R_imu_delta
+    RHS = delta_R_cam @ R_recovered
+    err = LHS @ RHS.T  # should be identity if R is correct
+    err_angle_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(err).as_rotvec()))
+    print(f"Constraint error with recovered R: {err_angle_deg:.4f} deg")
 
-R_recovered = Rotation.from_rotvec(result.x[:3]).as_matrix()
+    # Compare with identity
+    R_id = np.eye(3)
+    LHS_id = R_id @ R_imu_delta
+    RHS_id = delta_R_cam @ R_id
+    err_id = LHS_id @ RHS_id.T
+    err_id_angle_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(err_id).as_rotvec()))
+    print(f"Constraint error with identity:    {err_id_angle_deg:.4f} deg")
 
-# Find the window with significant rotation
-i = np.argmax(gt_rot_deg)  # window with most rotation
-print(f"Window {i}: GT rotation = {gt_rot_deg[i]:.2f} deg")
+    # Find a window with rotation primarily around one Vicon axis
+    # Compute axis-angle for each window's GT rotation
+    gt_axes = []
+    for i in range(len(gt_rot_deg)):
+        if gt_rot_deg[i] > 3:  # significant rotation
+            T_i  = vicon_pose_at_index(seq.groundtruth, i)
+            T_i1 = vicon_pose_at_index(seq.groundtruth, i+1)
+            dT = relative_motion(T_i, T_i1)
+            rotvec = Rotation.from_matrix(dT[:3, :3]).as_rotvec()
+            axis = rotvec / np.linalg.norm(rotvec)
+            gt_axes.append((i, axis, np.linalg.norm(rotvec)))
 
-# Apply the mask
-mask = np.where((seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1]))
-omega = seq.imu.angular_velocity[mask]
-int_timestamps_s = seq.imu.timestamps_ns[mask] / 1e9
-dt = np.mean(np.diff(int_timestamps_s))
-delta_Rot = np.sum(omega * dt, axis=0)
-R_imu_delta = Rotation.from_rotvec(delta_Rot).as_matrix()
-
-# Cam-marker coordinates
-T_i = vicon_pose_at_index(seq.groundtruth, i)
-T_i1 = vicon_pose_at_index(seq.groundtruth, i+1)
-dT_cam = relative_motion(T_i, T_i1)
-delta_R_cam = dT_cam[:3, :3]
-
-# Check the hand-eye constraint with recovered R
-# Constraint: R · R_imu = R_marker · R
-LHS = R_recovered @ R_imu_delta
-RHS = delta_R_cam @ R_recovered
-err = LHS @ RHS.T  # should be identity if R is correct
-err_angle_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(err).as_rotvec()))
-print(f"Constraint error with recovered R: {err_angle_deg:.4f} deg")
-
-# Compare with identity
-R_id = np.eye(3)
-LHS_id = R_id @ R_imu_delta
-RHS_id = delta_R_cam @ R_id
-err_id = LHS_id @ RHS_id.T
-err_id_angle_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(err_id).as_rotvec()))
-print(f"Constraint error with identity:    {err_id_angle_deg:.4f} deg")
-
-# Find a window with rotation primarily around one Vicon axis
-# Compute axis-angle for each window's GT rotation
-gt_axes = []
-for i in range(len(gt_rot_deg)):
-    if gt_rot_deg[i] > 3:  # significant rotation
-        T_i  = vicon_pose_at_index(seq.groundtruth, i)
-        T_i1 = vicon_pose_at_index(seq.groundtruth, i+1)
-        dT = relative_motion(T_i, T_i1)
-        rotvec = Rotation.from_matrix(dT[:3, :3]).as_rotvec()
-        axis = rotvec / np.linalg.norm(rotvec)
-        gt_axes.append((i, axis, np.linalg.norm(rotvec)))
-
-# Find one where rotation is primarily about a single axis
-for i, axis, angle in gt_axes[:20]:
-    dominant = np.argmax(np.abs(axis))
-    if np.abs(axis[dominant]) > 0.9:  # >90% on one axis
-        print(f"Window {i}: GT axis ~{['x','y','z'][dominant]} ({axis}), angle {np.degrees(angle):.2f}°")
-        
-        # Compute IMU axis for same window
-        mask = (seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & \
-               (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1])
-        omega = seq.imu.angular_velocity[mask]
-        ts = seq.imu.timestamps_ns[mask] / 1e9
-        dt = np.mean(np.diff(ts))
-        delta_Rot = np.sum(omega * dt, axis=0)
-        imu_axis = delta_Rot / np.linalg.norm(delta_Rot)
-        imu_dominant = np.argmax(np.abs(imu_axis))
-        print(f"           IMU axis ~{['x','y','z'][imu_dominant]} ({imu_axis})")
-        print()
-        if i > gt_axes[15][0]:  # show a few
-            break
+    # Find one where rotation is primarily about a single axis
+    for i, axis, angle in gt_axes[:20]:
+        dominant = np.argmax(np.abs(axis))
+        if np.abs(axis[dominant]) > 0.9:  # >90% on one axis
+            #print(f"Window {i}: GT axis ~{['x','y','z'][dominant]} ({axis}), angle {np.degrees(angle):.2f}°")
+            
+            # Compute IMU axis for same window
+            mask = (seq.imu.timestamps_ns >= seq.groundtruth.ds_timestamps_ns[i]) & \
+                (seq.imu.timestamps_ns <= seq.groundtruth.ds_timestamps_ns[i+1])
+            omega = seq.imu.angular_velocity[mask]
+            ts = seq.imu.timestamps_ns[mask] / 1e9
+            dt = np.mean(np.diff(ts))
+            delta_Rot = np.sum(omega * dt, axis=0)
+            imu_axis = delta_Rot / np.linalg.norm(delta_Rot)
+            imu_dominant = np.argmax(np.abs(imu_axis))
+            #print(f"           IMU axis ~{['x','y','z'][imu_dominant]} ({imu_axis})")
+            #print()
+            if i > gt_axes[15][0]:  # show a few
+                break
 
 
 
-# -- Result Plots -- #
-res_norms = np.linalg.norm(res_rot, axis=1)
+    # -- Result Plots -- #
+    res_norms = np.linalg.norm(res_rot, axis=1)
 
-# Make sure gt_rot_deg is aligned to the same windows as res_norms
-# (drop any skipped windows from both, or use np.nan masking)
-gt_rot_deg = np.array(gt_rot_deg)
+    # Make sure gt_rot_deg is aligned to the same windows as res_norms
+    # (drop any skipped windows from both, or use np.nan masking)
+    gt_rot_deg = np.array(gt_rot_deg)
 
-# Scatter with color encoding rotation magnitude
-fig, ax = plt.subplots(figsize=(10, 5))
-sc = ax.scatter(
-    np.arange(len(res_norms)),
-    res_norms,
-    c=gt_rot_deg,
-    cmap='viridis',  # or 'plasma', 'magma' — perceptually uniform
-    s=15,
-    alpha=0.7,
-)
+    # Scatter with color encoding rotation magnitude
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sc = ax.scatter(
+        np.arange(len(res_norms)),
+        res_norms,
+        c=gt_rot_deg,
+        cmap='viridis',  # or 'plasma', 'magma' — perceptually uniform
+        s=15,
+        alpha=0.7,
+    )
 
-cbar = plt.colorbar(sc, ax=ax)
-cbar.set_label('GT rotation (deg)')
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label('GT rotation (deg)')
 
-ax.set_xlabel('Window index')
-ax.set_ylabel('Residual norm (rad)')
-ax.set_title('Per-window residual after convergence, colored by rotation magnitude')
+    ax.set_xlabel('Window index')
+    ax.set_ylabel('Residual norm (rad)')
+    ax.set_title('Per-window residual after convergence, colored by rotation magnitude')
 
+    plt.tight_layout()
+    plt.show()
+
+
+
+    # -- Ground Truth Check -- #
+
+    # From YAML file
+    T_BS_vicon = np.array([
+        [ 0.33638, -0.01749,  0.94156],
+        [-0.02078, -0.99972, -0.01114],
+        [ 0.94150, -0.01582, -0.33665]
+    ])
+
+    # YAML gives T_body_vicon. We want T_marker_imu = T_vicon_body @ T_body_imu = T_vicon_body
+    R_marker_imu_yaml = T_BS_vicon.T  # inverse of a rotation is its transpose
+
+    rotvec_yaml = Rotation.from_matrix(R_marker_imu_yaml).as_rotvec()
+    rotvec_recovered = recovered_rotvecs[jj]
+
+    print(f"YAML rotvec:      {rotvec_yaml}")
+    print(f"Recovered rotvec: {rotvec_recovered}")
+    print(f"YAML angle:       {np.degrees(np.linalg.norm(rotvec_yaml)):.2f}°")
+    print(f"Recovered angle:  {np.degrees(np.linalg.norm(rotvec_recovered)):.2f}°")
+
+    # Direct comparison: error between the two rotations
+    R_recovered = Rotation.from_rotvec(rotvec_recovered).as_matrix()
+    R_diff = R_marker_imu_yaml @ R_recovered.T
+    err_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(R_diff).as_rotvec()))
+    print(f"Difference between recovered and YAML: {err_deg:.3f}°")
+
+
+
+# Plot summary of results across sequences
+print("\nSummary across sequences:")
+for jj in range(len(MAV_Sequence_Paths)):
+    print(f"Sequence {jj+1}:")
+    print(f"Recovered rotvec: {recovered_rotvecs[jj]}")
+    print(f"Recovered rotation (deg): {recovered_rotation_magnitudes_deg[jj]:.4f}")
+    print(f"Axis uncertainty (deg): {axis_uncertainty_deg[jj]}")
+    print(f"Total GT rotation (deg): {np.array2string(total_rotation_deg[jj], precision=2)}")
+
+# Scatter plot: total_rotation_deg vs axis_uncertainty_deg, colored by sequence
+seq_labels = ["V1_01 easy", "V1_02 medium", "V1_03 difficult"]
+colors = ["tab:blue", "tab:orange", "tab:green"]
+axis_labels = ["x", "y", "z"]
+
+averaged_axis_uncertainty_deg = np.mean(np.vstack(axis_uncertainty_deg),axis=1)
+
+
+fig, ax = plt.subplots(figsize=(8, 5))
+for jj in range(len(MAV_Sequence_Paths)):
+    #x = total_rotation_deg[jj]       # shape (3,)
+    x = condition_numbers[jj]
+    y = averaged_axis_uncertainty_deg[jj]     # shape (3,)
+    sc = ax.scatter(x, y, color=colors[jj], label=seq_labels[jj], s=60, zorder=3)
+    #for k, lbl in enumerate(axis_labels):
+    #    ax.annotate(lbl, (x[k], y[k]), textcoords="offset points", xytext=(5, 3), fontsize=8, color=colors[jj])
+
+ax.set_xlabel("Condition number")
+ax.set_ylabel("Axis uncertainty (deg)")
+ax.set_title("Axis uncertainty vs. condition number, by sequence")
+ax.legend()
 plt.tight_layout()
 plt.show()
 
+fig, ax = plt.subplots(figsize=(8, 5))
+for jj in range(len(MAV_Sequence_Paths)):
+    x = total_rotation_deg[jj]       # shape (3,)
+    y = axis_uncertainty_deg[jj]     # shape (3,)
+    sc = ax.scatter(x, y, color=colors[jj], label=seq_labels[jj], s=60, zorder=3)
+    for k, lbl in enumerate(axis_labels):
+        ax.annotate(lbl, (x[k], y[k]), textcoords="offset points", xytext=(5, 3), fontsize=8, color=colors[jj])
 
-
-
-
-
-# -- Ground Truth Check -- #
-
-# From YAML file
-T_BS_vicon = np.array([
-    [ 0.33638, -0.01749,  0.94156],
-    [-0.02078, -0.99972, -0.01114],
-    [ 0.94150, -0.01582, -0.33665]
-])
-
-# YAML gives T_body_vicon. We want T_marker_imu = T_vicon_body @ T_body_imu = T_vicon_body
-R_marker_imu_yaml = T_BS_vicon.T  # inverse of a rotation is its transpose
-
-rotvec_yaml = Rotation.from_matrix(R_marker_imu_yaml).as_rotvec()
-rotvec_recovered = np.array([-2.55373041, -0.02244341, -1.79270892])
-
-print(f"YAML rotvec:      {rotvec_yaml}")
-print(f"Recovered rotvec: {rotvec_recovered}")
-print(f"YAML angle:       {np.degrees(np.linalg.norm(rotvec_yaml)):.2f}°")
-print(f"Recovered angle:  {np.degrees(np.linalg.norm(rotvec_recovered)):.2f}°")
-
-# Direct comparison: error between the two rotations
-R_recovered = Rotation.from_rotvec(rotvec_recovered).as_matrix()
-R_diff = R_marker_imu_yaml @ R_recovered.T
-err_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(R_diff).as_rotvec()))
-print(f"Difference between recovered and YAML: {err_deg:.3f}°")
+ax.set_xlabel("Total rotation (deg)")
+ax.set_ylabel("Axis uncertainty (deg)")
+ax.set_title("Axis uncertainty vs. total rotation, by sequence")
+ax.legend()
+plt.tight_layout()
+plt.show()
